@@ -1,0 +1,573 @@
+---
+title: 'TCGA Differential Expression Analysis: Tumor vs Normal'
+author: "Thomas Norburn"
+date: "2025-10-16"
+output: html_document
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+# 1) Download required packages and data
+
+Relevant packages (if not already downloaded)
+
+```{r}
+if (!requireNamespace("BiocManager", quietly=TRUE)) install.packages("BiocManager")
+BiocManager::install(c('TCGAbiolinks','GO.db','DESeq2','edgeR','limma','pheatmap'
+                       ,'ComplexHeatmap','clusterProfiler','org.Hs.eg.db','AnnotationDbi'
+                       ,'biomaRt','EnhancedVolcano','survival','survminer', 'clusterProfiler', 'enrichplot',
+                       'ReactomePA'))
+```
+
+Load packages
+
+```{r}
+library(DESeq2)
+library(data.table)
+library(edgeR)
+library(limma)
+library(pheatmap)
+library(ComplexHeatmap)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(AnnotationDbi)
+library(biomaRt)
+library(EnhancedVolcano)
+library(survival)
+library(survminer)
+library(enrichplot)
+library(ReactomePA)
+```
+
+```{r}
+library(TCGAbiolinks)
+query <- GDCquery(project = 'TCGA-LUAD',
+                  data.category = 'Transcriptome Profiling',
+                  data.type = 'Gene Expression Quantification',
+                  workflow.type = 'STAR - Counts')
+GDCdownload(
+  query,
+  directory = "C:\\Users\\tno\\Documents\\Coding" #save in your own fodler
+)
+data <- GDCprepare(
+  query,
+  directory = "C:\\Users\\tno\\Documents\\Coding" #save in your own folder
+)
+```
+
+# 2) Save the prepared data to an .RData file
+
+```{r}
+save(data, file = "C:\\Users\\tno\\Documents\\Coding")  #save in your own folder
+```
+
+> Once saved you can load the data to save time for next time
+
+```{r}
+load("C:\\Users\\tno\\Documents\\Coding")
+```
+
+# 3) Extract counts and clinical data
+
+> We start by extracting the expression counts and clinical metadata
+> from the TCGA dataset. This separates the numeric expression data from
+> patient/sample-level information, which is necessary for downstream
+> analyses.
+
+```{r}
+counts <- assay(data)
+clinical <- colData(data)
+```
+
+## Ensure column names are unique
+
+```{r}
+colnames(counts) <- make.names(colnames(counts), unique=TRUE)
+```
+
+## Ensure column names are unique and formatted consistently
+
+> Why:
+
+-   Ensure unique column names for proper alignment with clinical data.
+-   Remove version numbers from Ensembl IDs for consistency.
+-   Standardize naming conventions to prevent mismatches in downstream
+    steps.
+
+```{r}
+rownames(counts) <- sub("\\..*", "", rownames(counts))
+rownames(counts)
+colnames(counts) <- gsub("\\.", "-", colnames(counts))
+colnames(counts)
+```
+
+## Check available clinical columns
+
+```{r}
+colnames(clinical)
+clinical$sample_type
+table(clinical$sample_type)
+```
+
+## Create a clean group variable (Tumor vs Normal)
+
+```{r}
+clinical$group <- ifelse(clinical$sample_type == "Solid Tissue Normal", 
+                         "Normal", 
+                         "Tumor")
+```
+
+## Make it a factor so DESeq2 knows the reference level
+
+```{r}
+clinical$group <- factor(clinical$group, levels = c("Normal", "Tumor"))
+```
+
+## (Optional) remove NAs and ensure counts and clinical align
+
+```{r}
+all(colnames(counts) == rownames(clinical))  # should return TRUE
+```
+
+## Align sample IDs between counts and clinical to prevent errors
+
+```{r}
+common_samples <- intersect(colnames(counts), rownames(clinical))
+counts <- counts[, common_samples]
+clinical <- clinical[common_samples, ]
+stopifnot(all(colnames(counts) == rownames(clinical)))
+
+clinical$group
+```
+
+# 4) QC filtering
+
+> Remove genes with low counts across samples (e.g., CPM \< 1 in at
+> least X samples).
+>
+> Examine library sizes, sample clustering, PCA before/after
+> normalization.
+>
+> Why:
+
+-   Remove genes with low expression across samples.
+
+-   Normalize counts using TMM (edgeR) to account for library size
+    differences.
+
+-   Prepare log-transformed CPM for exploratory analysis.
+
+```{r}
+dge <- DGEList(counts=counts)
+keep <- filterByExpr(dge, group=clinical$group)
+dge <- dge[keep, , keep.lib.sizes=FALSE]
+dge <- calcNormFactors(dge) # TMM normalization
+logCPM <- cpm(dge, log=TRUE)
+```
+
+## PCA for Quality Check
+
+> PCA visualizes sample clustering based on global gene expression.
+>
+> Detect potential batch effects or outliers.
+
+```{r}
+pr <- prcomp(t(logCPM))
+plot(pr$x[, 1:2],
+     col = ifelse(clinical$group == "Tumor", "red", "blue"),
+     pch = 16, xlab = "PC1", ylab = "PC2",
+     main = "PCA of logCPM (edgeR-normalized)")
+```
+
+# 5) Differential expression (DEseq2)
+
+## Create the DESeq2 dataset
+
+> DESeq2 is a robust method for RNA-seq DE analysis.
+>
+> Identify genes significantly up- or down-regulated between tumor and
+> normal tissues.
+
+```{r}
+counts_filtered <- counts[keep, ]
+dds <- DESeqDataSetFromMatrix(
+  countData = counts_filtered,
+  colData   = clinical,
+  design    = ~ group
+)
+```
+
+## Run DESeq2
+
+```{r}
+dds <- DESeq(dds)
+res <- results(dds, contrast = c("group", "Tumor", "Normal"))
+resOrdered <- res[order(res$padj), ]
+```
+
+> Save DESeq2 results
+
+```{r}
+dir.create("results", showWarnings = FALSE)
+write.csv(as.data.frame(resOrdered), file = "results/deseq2_results.csv")
+```
+
+## PCA on DESeq2 normalized counts
+
+> PCA on DESeq2-normalized counts confirms sample grouping
+> post-normalization.
+
+```{r}
+vsd <- vst(dds)
+plotPCA(vsd, intgroup = "group")
+```
+
+> Remove version numbers if still present
+
+```{r}
+rownames(resOrdered) <- sub("\\..*", "", rownames(resOrdered))
+```
+
+> Map Ensembl to HGNC symbols
+
+```{r}
+resOrdered$symbol <- mapIds(org.Hs.eg.db,
+                            keys = rownames(resOrdered),
+                            column = "SYMBOL",
+                            keytype = "ENSEMBL",
+                            multiVals = "first")
+```
+
+> Replace any missing symbols with Ensembl IDs
+
+```{r}
+resOrdered$symbol[is.na(resOrdered$symbol)] <- rownames(resOrdered)[is.na(resOrdered$symbol)]
+```
+
+> Label top 10 up and 10 down
+
+```{r}
+resOrdered$label <- ""
+top_up <- head(rownames(resOrdered[order(resOrdered$log2FoldChange, decreasing=TRUE), ]), 10)
+top_down <- head(rownames(resOrdered[order(resOrdered$log2FoldChange, decreasing=FALSE), ]), 10)
+resOrdered$label[rownames(resOrdered) %in% c(top_up, top_down)] <- resOrdered$symbol[rownames(resOrdered) %in% c(top_up, top_down)]
+```
+
+# 6) Volcano plot (classic TCGA style)
+
+> Visualize the most significant and biologically meaningful DEGs.
+>
+> Highlight top 10 up- and down-regulated genes.
+
+```{r}
+
+EnhancedVolcano(resOrdered,
+                lab = resOrdered$label,
+                x = "log2FoldChange",
+                y = "padj",
+                pCutoff = 0.05,
+                FCcutoff = 1,
+                title = "Differential Expression: Tumor vs Normal",
+                subtitle = "TCGA-LUAD",
+                caption = "DESeq2 analysis",
+                pointSize = 2.5,
+                labSize = 3.0,
+                col = c("blue", "yellow", "black", "red"),
+                colAlpha = 1,
+                drawConnectors = TRUE,
+                widthConnectors = 0.5,
+                gridlines.major = FALSE,
+                gridlines.minor = FALSE)
+
+```
+
+# 7) Heatmap of top DEGs
+
+> Heatmap of top DEGs shows expression patterns across samples.
+>
+> Scaled rows help compare relative expression across samples.
+
+```{r}
+topGenes <- rownames(head(resOrdered, 50))
+norm_counts <- assay(vsd)
+mat <- norm_counts[topGenes, ]
+pheatmap(mat, scale = "row", annotation_col = data.frame(Group = clinical$group))
+
+summary(res$padj < 0.05)
+head(resOrdered)
+```
+
+# 8) Correlation with clinical variables
+
+> Explore how top DEGs correlate with each other or with continuous
+> clinical variables. Identify potential co-regulated gene modules or
+> biomarkers.
+
+```{r}
+clinical_df <- as.data.frame(colData(dds))
+colnames(clinical_df)
+```
+
+> Example: Correlation among top DE genes
+
+```{r}
+topGenes <- head(resOrdered[order(resOrdered$padj), ], 20)
+exprMatrix <- assay(vst(dds))[rownames(topGenes), ]
+```
+
+> Use gene symbols as row/column labels
+
+```{r}
+rownames(exprMatrix) <- topGenes$symbol
+
+corMatrix <- cor(t(exprMatrix), method = "spearman")
+
+pheatmap(corMatrix,
+         clustering_distance_rows = "correlation",
+         clustering_distance_cols = "correlation",
+         main = "Correlation among top 20 DE genes (Spearman)",
+         fontsize = 10)
+```
+
+# 9) Pathway enrichment and annotation
+
+> Prepare DE genes for enrichment
+>
+> Filter significant DEGs (adjusted p-value \< 0.05)
+>
+> Why:
+
+-   Determine which biological pathways are enriched among DEGs.
+
+-   GO (Biological Process), KEGG, and Reactome provide complementary
+    functional insights.
+
+-   Helps interpret DE results in a biological context.
+
+```{r}
+sig_genes <- resOrdered[which(resOrdered$padj < 0.05 & !is.na(resOrdered$padj)), ]
+```
+
+> Get Entrez IDs for clusterProfiler
+>
+> Why this code:
+>
+> -   Most pathway databases (KEGG, Reactome, GO) use Entrez Gene IDs
+>     instead of Ensembl IDs.
+>
+> -   The mapIds() function from org.Hs.eg.db converts gene identifiers.
+>
+> -   Setting multiVals = "first" handles cases where multiple Entrez
+>     IDs map to one Ensembl ID, keeping the pipeline clean.
+>
+> Why this step is important:
+>
+> -   It ensures compatibility with downstream tools like
+>     clusterProfiler and ReactomePA, which rely on Entrez IDs for
+>     annotation.
+
+```{r}
+sig_genes$entrez <- mapIds(org.Hs.eg.db,
+                           keys = rownames(sig_genes),
+                           column = "ENTREZID",
+                           keytype = "ENSEMBL",
+                           multiVals = "first")
+```
+
+> Remove Unmapped Genes
+>
+> Why this code:
+>
+> -   Some genes cannot be mapped to Entrez IDs (e.g., novel or
+>     unannotated transcripts).
+>
+> -   Removing NAs ensures enrichment analysis is performed only on
+>     recognized genes, avoiding functionless entries that could distort
+>     pathway results.
+
+```{r}
+sig_entrez <- na.omit(sig_genes$entrez)
+```
+
+> Create ranked gene list for GSEA (log2FC)
+>
+> Why this code:
+>
+> -   A ranked gene list is required for Gene Set Enrichment Analysis
+>     (GSEA).
+>
+> -   Genes are ranked by log2 fold change, showing the direction and
+>     magnitude of expression change.
+>
+> -   Sorting in decreasing order ensures upregulated genes appear
+>     first.
+>
+> Why this technique:
+>
+> -   Unlike overrepresentation analysis (ORA), GSEA considers all genes
+>     ranked by expression change, reducing bias toward arbitrary
+>     p-value cutoffs and highlighting subtle but coordinated changes in
+>     biological pathways.
+
+```{r}
+geneList <- resOrdered$log2FoldChange
+names(geneList) <- mapIds(org.Hs.eg.db,
+                          keys = rownames(resOrdered),
+                          column = "ENTREZID",
+                          keytype = "ENSEMBL",
+                          multiVals = "first")
+geneList <- sort(na.omit(geneList), decreasing = TRUE)
+```
+
+## GO (Gene Ontology) enrichment
+
+Why this code:
+
+-   enrichGO() identifies overrepresented GO terms among significant
+    genes.
+
+-   ont = "BP" specifies Biological Process, one of the three GO domains
+    (BP, MF, CC).
+
+-   pAdjustMethod = "BH" ensures multiple testing correction.
+
+-   readable = TRUE converts Entrez IDs back to gene symbols for easier
+    interpretation.
+
+Why GO analysis:
+
+-   GO enrichment reveals biological processes or functions most
+    affected by differential expression.
+
+-   Helps interpret what cellular or molecular mechanisms might be
+    driving tumor vs normal differences.
+
+```{r}
+ego_bp <- enrichGO(gene         = sig_entrez,
+                   OrgDb        = org.Hs.eg.db,
+                   keyType      = "ENTREZID",
+                   ont          = "BP",
+                   pAdjustMethod = "BH",
+                   qvalueCutoff = 0.05,
+                   readable     = TRUE)  # converts Entrez IDs to gene symbols
+```
+
+> View top 10 GO terms
+
+```{r}
+head(ego_bp, 10)
+```
+
+> Dotplot visualization
+>
+> Why:
+>
+> -   Visual summaries allow rapid identification of enriched terms.
+>
+> -   Dotplots display term significance and gene ratio, while barplots
+>     rank pathways by enrichment strength.
+>
+> -   Visualizing results aids biological storytelling and data
+>     presentation.
+
+```{r}
+dotplot(ego_bp, showCategory = 15) + ggtitle("GO BP Enrichment (Tumor vs Normal)")
+```
+
+> Optional: Barplot
+
+```{r}
+barplot(ego_bp, showCategory = 15)
+```
+
+## KEGG pathway enrichment
+
+Why this code:
+
+-   enrichKEGG() identifies pathways from the KEGG database, covering
+    signaling and metabolic routes.
+
+-   Setting organism = "hsa" specifies human pathways.
+
+-   setReadable() converts numeric IDs to readable gene symbols for
+    better interpretation.
+
+Why KEGG:
+
+-   KEGG provides well-curated molecular interaction maps linking genes
+    to known pathways.
+
+-   It offers mechanistic insights into cell signaling, metabolism, and
+    disease pathways impacted by gene dysregulation.
+
+```{r}
+ekegg <- enrichKEGG(
+  gene         = sig_entrez,
+  organism     = "hsa",
+  keyType      = "kegg",   # specify the KEGG key type
+  pvalueCutoff = 0.05
+)
+```
+
+> Convert Entrez IDs to readable gene symbols
+
+```{r}
+ekegg <- setReadable(ekegg, OrgDb = org.Hs.eg.db, keyType = "ENTREZID")
+```
+
+> Visualization
+
+```{r}
+dotplot(ekegg, showCategory = 15) + ggtitle("KEGG Pathway Enrichment (Readable Gene Symbols)")
+```
+
+## Reactome pathway enrichment
+
+Why this code:
+
+-   enrichPathway() (from ReactomePA) analyzes enrichment against the
+    Reactome database.
+
+-   Reactome focuses on manually curated molecular pathways,
+    complementing KEGG.
+
+-   readable = TRUE again makes results human-friendly.
+
+Why Reactome:
+
+-   Offers highly detailed and hierarchical pathway maps, often more
+    granular than KEGG.
+
+-   Captures signal transduction, immune response, and gene regulation
+    pathways relevant to cancer biology.
+
+```{r}
+react <- enrichPathway(gene       = sig_entrez,
+                       organism   = "human",
+                       pvalueCutoff = 0.05,
+                       readable   = TRUE)
+```
+
+> Look at the top Reactome pathways
+
+```{r}
+head(react, 10)
+```
+
+> Visualization
+
+```{r}
+dotplot(react, showCategory = 15) + ggtitle("Reactome Pathway Enrichment")
+```
+
+# 10) Save data in your local drive
+
+```{r}
+dir.create("results//enrichment", showWarnings = FALSE)
+
+write.csv(as.data.frame(ego_bp), file =
+"results//enrichment//GO_BP.csv") write.csv(as.data.frame(ekegg), file =
+"results//enrichment//KEGG.csv") write.csv(as.data.frame(react), file =
+"results//enrichment//Reactome.csv")
+```
