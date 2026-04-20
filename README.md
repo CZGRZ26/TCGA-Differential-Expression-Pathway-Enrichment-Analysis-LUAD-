@@ -89,3 +89,31 @@ All key results are saved for easy access and reproducibility:
 -  Pathway enrichment translates gene-level results into biological meaning.
 
 -  The pipeline is fully reproducible and suitable for portfolio use, research reports, or publication.
+
+ ## Updated script
+
+Added an updated r script using
+
+## Bug Fixes & Improvements
+
+save()/load() paths corrected — both previously pointed to a directory rather than a file, which would cause a runtime error. Now reference tcga_luad.RData explicitly.
+write.csv() calls fixed — all three calls in Section 10 were broken across two lines, causing parse errors. Consolidated to single lines with correct results/enrichment/ paths.
+
+## Logic Fixes
+
+Volcano plot labels now filter by significance — top 10 up/down genes are now selected from padj < 0.05 genes only, preventing statistically non-significant genes from being highlighted.
+topGenes variable name conflict resolved — the same variable was reused as a character vector (Section 7) and a data frame (Section 8). Renamed to topGenes_vec and topGenes_df respectively to prevent cross-chunk errors.
+Redundant vst() call removed — vst(dds) was called twice. Section 8 now reuses the vsd object created in Section 5, saving compute time on large datasets.
+
+## Robustness & Reproducibility
+
+Guard added before enrichment analysis — if sig_entrez is empty (no genes pass the significance threshold), the pipeline now stops with a clear, informative error message rather than failing silently inside enrichGO()/enrichKEGG()/enrichPathway().
+Hardcoded paths centralised — base_dir and rdata_file are now defined once in a dedicated config chunk at the top of the script. All downstream steps reference these variables, making the pipeline portable.
+sessionInfo() added — records exact R and package versions at the end of the report for full reproducibility.
+
+## Style & Clarity
+
+Duplicate clusterProfiler removed from BiocManager::install().
+summary(res$padj < 0.05) moved to its own dedicated chunk so it renders as a clearly labelled output in the report rather than being buried inside the heatmap chunk.
+
+  
